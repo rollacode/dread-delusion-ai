@@ -113,9 +113,10 @@ land on the same Extensions card.
    folder).
 3. CodeTerm shows the approval prompt; the user reviews the four capabilities,
    confirms the game-folder workspace path, and approves.
-4. We receive the one-time scoped token, store it (in CodeTerm's secrets store
-   under a connector-prefixed name, or our own config if simpler), and from then
-   on drive CodeTerm with it.
+4. We receive the one-time scoped token, store it in our own config, and from
+   then on drive CodeTerm with it. Any secret *we* need (the ElevenLabs key) goes
+   into our **per-connector secret bucket** — declared by name in the manifest,
+   filled by the user/agent at setup; we never touch CodeTerm's global store.
 
 If the user later removes the connector in CodeTerm's Extensions surface, our
 token is revoked and the NPC server's calls 401 — the game falls back to the
@@ -180,8 +181,12 @@ Via `settings.schema.json`, schema-rendered on our Extensions card:
 - **Model tier mapping** per character class (strong/medium/weak → the user's
   pick), with sensible defaults from §7.
 - **Game folder** (auto-detected, overridable).
-- **TTS** on/off + voice mapping (ties into the ElevenLabs work; the API key
-  lives in CodeTerm's secrets store, read by our connector, never hardcoded).
+- **TTS** on/off + voice mapping (ties into the ElevenLabs work). The ElevenLabs
+  API key is a **named secret our connector declares** (`elevenlabs_api_key`); the
+  user (or the General Agent on their behalf) drops it into our **per-connector
+  secret bucket** at setup. We never get access to CodeTerm's global secret store
+  — only our own bucket. No key → TTS is simply off and NPCs **type their replies
+  as text** (the static русификатор text path), never a broken state.
 - **Live NPCs** master toggle (off → pure static dialogue).
 
 ## 10. Build / packaging
