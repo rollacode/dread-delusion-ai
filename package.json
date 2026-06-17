@@ -16,7 +16,7 @@
     "demo": "npm run build && node mock_game/host_stub.mjs demo"
   },
   "devDependencies": {
-    "@codeterm/plugin-sdk": "file:../codeterm-alpha/packages/plugin-sdk",
+    "@codeterm/plugin-sdk": "^1.4.9",
     "esbuild": "^0.28.1",
     "tsx": "^4.22.4",
     "typescript": "^5.9.3"
