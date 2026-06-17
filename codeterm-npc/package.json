@@ -1,0 +1,10 @@
+{
+  "name": "@codeterm/plugin-codeterm-npc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CodeTerm chatBackend plugin: a multi-NPC acting stage for Dread Delusion.",
+  "devDependencies": {
+    "@codeterm/plugin-sdk": "^1.4.7"
+  }
+}

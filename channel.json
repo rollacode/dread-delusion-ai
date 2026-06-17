@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "dread-delusion-ai",
+  "displayName": "Dread Delusion AI",
+  "description": "Dread Delusion's own CodeTerm plugin channel — the codeterm-npc multi-NPC chatBackend. A separate, third-party-style channel, installable via `codeterm plugin channel add https://github.com/rollacode/dread-delusion-ai.git`.",
+  "plugins": [
+    {
+      "id": "codeterm-npc",
+      "path": "codeterm-npc",
+      "version": "0.1.0",
+      "minCodeterm": "1.0.0"
+    }
+  ]
+}
