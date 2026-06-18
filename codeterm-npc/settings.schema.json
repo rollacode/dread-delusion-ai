@@ -52,7 +52,7 @@
         "kind": "text",
         "key": "defaultModel",
         "label": "Default NPC model",
-        "placeholder": "claude-haiku-4-5-20251001",
+        "placeholder": "haiku",
         "description": "Model tier the NPC agent sessions spawn with."
       }
     ]

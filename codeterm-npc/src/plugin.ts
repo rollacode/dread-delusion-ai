@@ -9,10 +9,14 @@
 // `emote`) that a spawned NPC agent calls back through `onAgentCommand` to act
 // on the (mock) game world.
 //
-// Authored against @codeterm/plugin-sdk TYPES only. The SDK-typed chatBackend
-// surface (openSession/sendMessage/poll/closeSession) is sync per contract; the
-// async NPC work (host.agent.*) the host drives via a poll-pump loop. In this
-// mock the host_stub calls `pump()` explicitly — see mock_game/host_stub.mjs.
+// Authored against @codeterm/plugin-sdk TYPES only. The whole surface is SYNC:
+// openSession/sendMessage/poll/closeSession AND the `host.agent.*` job-id/poll
+// binds (Item 6 — job-id/poll is sync per step). The async NPC work is driven by
+// the host calling `pump()` on EACH poll-loop tick: pump kicks off `host.agent.send`
+// for new player lines, then non-blockingly harvests any tickets that have since
+// completed (NEVER block-waits for a turn — that would stall the VM). On the real
+// daemon the host's chatBackend poll loop calls pump each tick; the mock host_stub
+// calls it once per turn (its agent replies resolve immediately).
 
 import type {
   ChatBackend,
@@ -41,7 +45,10 @@ const DEFAULTS: NpcSettings = {
   reminderEvery: 4,
   gameFolder: ".",
   maxSessions: 5,
-  defaultModel: "claude-haiku-4-5-20251001",
+  // Provider-relative model id (the claude provider exposes short ids:
+  // haiku/sonnet/opus). A full id like "claude-haiku-4-5-..." is rejected by
+  // the spawn-time model validation, so the NPC agent never starts.
+  defaultModel: "haiku",
   cast: ["npc_morozov", "npc_xenia", "npc_culwich"],
 };
 
@@ -146,6 +153,14 @@ interface PaneSession {
   inbox: string[]; // player lines awaiting NPC routing (sendMessage enqueues)
   outbox: NormalizedChatMessage[]; // NPC replies + action echoes (poll drains)
   msgSeq: number;
+  pending: PendingTurn[]; // NPC turns awaiting a reply (host.agent ticket in flight)
+}
+
+// An NPC turn kicked off via host.agent.send, awaiting its reply. pump harvests
+// these non-blockingly: one host.agent.poll per tick, push the reply when done.
+interface PendingTurn {
+  npcId: string;
+  ticket: string;
 }
 
 // Module-level state: the QuickJS VM is a per-plugin singleton, so this is the
@@ -179,8 +194,8 @@ function readPersona(npcId: string, gameFolder: string): string {
 }
 
 // get-or-spawn the keyed session for an npc, reaping the oldest idle one when
-// the pool is over its cap. Async: uses the host.agent.* job-id/poll bridge.
-async function ensureNpc(npcId: string, s: NpcSettings): Promise<PoolEntry> {
+// the pool is over its cap. Sync: the host.agent.* binds are sync per step (Item 6).
+function ensureNpc(npcId: string, s: NpcSettings): PoolEntry {
   const existing = pool.find((e) => e.npcId === npcId);
   if (existing) {
     existing.lastActiveMs = nowMs();
@@ -188,22 +203,22 @@ async function ensureNpc(npcId: string, s: NpcSettings): Promise<PoolEntry> {
   }
 
   if (workspaceId == null) {
-    const ws = await host.workspace.ensure({ name: "dread-npcs", externalRoot: s.gameFolder });
+    const ws = host.workspace.ensure({ name: "dread-npcs", externalRoot: s.gameFolder });
     workspaceId = ws.workspaceId;
   }
 
   // Re-attach a stored session for this key if the host remembers one (R3),
   // else spawn a fresh one with the persona as its task.
   let sessionId: string | null = null;
-  const found = await host.agent.get(workspaceId, npcId);
+  const found = host.agent.get(workspaceId, npcId);
   if (found) {
-    const resumed = await host.agent.resume(workspaceId, found.sessionId);
+    const resumed = host.agent.resume(workspaceId, found.sessionId);
     sessionId = resumed ? resumed.sessionId : null;
   }
   if (sessionId == null) {
     const persona = readPersona(npcId, s.gameFolder);
     const task = buildSpawnTask(npcId, persona, { scene: s.scene, commands: VERBS });
-    const spawned = await host.agent.spawn(workspaceId, {
+    const spawned = host.agent.spawn(workspaceId, {
       backend: { model: s.defaultModel },
       task,
       key: npcId,
@@ -212,7 +227,7 @@ async function ensureNpc(npcId: string, s: NpcSettings): Promise<PoolEntry> {
     sessionId = spawned.sessionId;
   }
 
-  await reapIfNeeded(s.maxSessions);
+  reapIfNeeded(s.maxSessions);
 
   const entry: PoolEntry = { npcId, sessionId, lastActiveMs: nowMs(), turns: 0 };
   pool.push(entry);
@@ -220,7 +235,7 @@ async function ensureNpc(npcId: string, s: NpcSettings): Promise<PoolEntry> {
   return entry;
 }
 
-async function reapIfNeeded(cap: number): Promise<void> {
+function reapIfNeeded(cap: number): void {
   while (pool.length >= cap && pool.length > 0) {
     let oldestIdx = 0;
     for (let i = 1; i < pool.length; i++) {
@@ -229,7 +244,7 @@ async function reapIfNeeded(cap: number): Promise<void> {
     const [victim] = pool.splice(oldestIdx, 1);
     bySession.delete(victim.sessionId);
     try {
-      await host.agent.reap(victim.sessionId);
+      host.agent.reap(victim.sessionId);
     } catch {
       /* best-effort */
     }
@@ -244,18 +259,15 @@ function resolveTargets(text: string, cast: string[]): { targets: string[]; line
   return { targets: cast.slice(), line: text };
 }
 
-// Run one NPC's turn: bump its counter, apply the cadence reminder, send via the
-// ticket/poll bridge, return the reply text.
-async function runNpcTurn(entry: PoolEntry, line: string, s: NpcSettings): Promise<string> {
+// Kick off one NPC's turn: bump its counter, apply the cadence reminder, send
+// via the ticket bridge, and return the in-flight ticket. Does NOT wait for the
+// reply — pump harvests it on a later tick (non-blocking, Item 6).
+function kickNpcTurn(entry: PoolEntry, line: string, s: NpcSettings): string {
   entry.turns += 1;
   entry.lastActiveMs = nowMs();
   const sent = applyReminder(line, entry.turns, s.reminderEvery, entry.npcId);
-  const { ticket } = await host.agent.send(entry.sessionId, sent);
-  for (let i = 0; i < 600; i++) {
-    const r = await host.agent.poll(ticket);
-    if (r.done) return r.reply ?? "";
-  }
-  return "";
+  const { ticket } = host.agent.send(entry.sessionId, sent);
+  return ticket;
 }
 
 function pushMsg(pane: PaneSession, type: string, content: string): void {
@@ -263,29 +275,50 @@ function pushMsg(pane: PaneSession, type: string, content: string): void {
   pane.outbox.push({ id: `${pane.paneId}-${pane.msgSeq}`, type, content });
 }
 
-// The async work the host drives after a sendMessage. In the mock, host_stub
-// calls pump() then poll(). Drains the pane inbox, fanning each player line out
-// to the addressed NPCs and buffering their in-character replies.
-async function pump(paneId: string): Promise<void> {
+// The turn-advance the host drives, called on EACH poll-loop tick (Item 6).
+// SYNCHRONOUS and NON-BLOCKING — one step per call:
+//   Phase 1: for each newly-arrived player line, fan out to the addressed NPCs,
+//            kicking each one's host.agent.send and recording the in-flight ticket.
+//   Phase 2: poll every pending ticket ONCE; a completed reply is pushed to the
+//            transcript, an unfinished one is left for the next tick.
+// It never block-waits for an agent turn (that would stall the whole VM); the
+// reply simply lands on whichever later tick the agent finishes.
+function pump(paneId: string): void {
   const pane = panes.get(paneId);
   if (!pane) return;
   const s = loadSettings();
+
+  // Phase 1 — kick sends for new player lines.
   while (pane.inbox.length) {
     const text = pane.inbox.shift() as string;
     pushMsg(pane, "user", text);
     const { targets, line } = resolveTargets(text, s.cast);
     for (const npcId of targets) {
-      const entry = await ensureNpc(npcId, s);
-      const reply = await runNpcTurn(entry, line, s);
-      pushMsg(pane, "assistant", `${npcId}: ${reply}`);
+      const entry = ensureNpc(npcId, s);
+      const ticket = kickNpcTurn(entry, line, s);
+      pane.pending.push({ npcId, ticket });
     }
   }
+
+  // Phase 2 — harvest any replies that have completed since the last tick.
+  const stillPending: PendingTurn[] = [];
+  for (const p of pane.pending) {
+    const r = host.agent.poll(p.ticket);
+    if (r.done) {
+      pushMsg(pane, "assistant", `${p.npcId}: ${r.reply ?? ""}`);
+    } else if (r.error) {
+      pushMsg(pane, "assistant", `${p.npcId}: [error: ${r.error}]`);
+    } else {
+      stillPending.push(p); // not done yet — check again next tick
+    }
+  }
+  pane.pending = stillPending;
 }
 
 // ── the plugin module ──
 
 interface NpcPlugin extends ChatBackend, AgentCommandHandler {
-  pump(paneId: string): Promise<void>;
+  pump(paneId: string): void;
   [key: string]: unknown;
 }
 
@@ -293,7 +326,7 @@ const plugin: NpcPlugin = {
   // chatBackend: one session == one chat pane.
   openSession(ctx: { paneId: string; config: unknown }): { sessionId: string } {
     const sessionId = `npc-pane-${ctx.paneId}`;
-    panes.set(sessionId, { paneId: sessionId, inbox: [], outbox: [], msgSeq: 0 });
+    panes.set(sessionId, { paneId: sessionId, inbox: [], outbox: [], msgSeq: 0, pending: [] });
     return { sessionId };
   },
 
@@ -313,7 +346,10 @@ const plugin: NpcPlugin = {
     if (!pane) return { messages: [], cursor: cursor ?? "0", done: true };
     const from = cursor ? parseInt(cursor, 10) || 0 : 0;
     const messages = pane.outbox.slice(from);
-    return { messages, cursor: String(pane.outbox.length), done: pane.inbox.length === 0 };
+    // The turn is complete only when nothing is queued AND no NPC reply is still
+    // in flight — so the client keeps polling while pump harvests pending tickets.
+    const done = pane.inbox.length === 0 && pane.pending.length === 0;
+    return { messages, cursor: String(pane.outbox.length), done };
   },
 
   closeSession(sessionId: string): void {
@@ -322,15 +358,16 @@ const plugin: NpcPlugin = {
 
   listModels(): Model[] {
     return [
-      { id: "claude-haiku-4-5-20251001", displayName: "Claude Haiku 4.5 (fast NPCs)" },
-      { id: "claude-opus-4-8", displayName: "Claude Opus 4.8 (lead roles)" },
+      { id: "haiku", displayName: "Claude Haiku (fast NPCs)" },
+      { id: "sonnet", displayName: "Claude Sonnet (balanced)" },
+      { id: "opus", displayName: "Claude Opus (lead roles)" },
     ];
   },
 
-  // The async work the host drives (poll-pump). Exposed so the mock host_stub
-  // can advance a turn without the real daemon loop.
-  pump(paneId: string): Promise<void> {
-    return pump(paneId);
+  // The host calls this each poll-loop tick to advance async NPC work (Item 6).
+  // Synchronous + non-blocking; the mock host_stub calls it once per turn too.
+  pump(paneId: string): void {
+    pump(paneId);
   },
 
   // The inverse seam: a spawned NPC agent ran `codeterm plugin codeterm-npc <verb>`.

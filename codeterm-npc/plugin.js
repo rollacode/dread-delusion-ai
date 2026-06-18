@@ -28,7 +28,10 @@ var DEFAULTS = {
   reminderEvery: 4,
   gameFolder: ".",
   maxSessions: 5,
-  defaultModel: "claude-haiku-4-5-20251001",
+  // Provider-relative model id (the claude provider exposes short ids:
+  // haiku/sonnet/opus). A full id like "claude-haiku-4-5-..." is rejected by
+  // the spawn-time model validation, so the NPC agent never starts.
+  defaultModel: "haiku",
   cast: ["npc_morozov", "npc_xenia", "npc_culwich"]
 };
 function loadSettings() {
@@ -104,26 +107,26 @@ function readPersona(npcId, gameFolder) {
   const fm = raw.match(/^---\n[\s\S]*?\n---\n?/);
   return (fm ? raw.slice(fm[0].length) : raw).trim();
 }
-async function ensureNpc(npcId, s) {
+function ensureNpc(npcId, s) {
   const existing = pool.find((e) => e.npcId === npcId);
   if (existing) {
     existing.lastActiveMs = nowMs();
     return existing;
   }
   if (workspaceId == null) {
-    const ws = await host.workspace.ensure({ name: "dread-npcs", externalRoot: s.gameFolder });
+    const ws = host.workspace.ensure({ name: "dread-npcs", externalRoot: s.gameFolder });
     workspaceId = ws.workspaceId;
   }
   let sessionId = null;
-  const found = await host.agent.get(workspaceId, npcId);
+  const found = host.agent.get(workspaceId, npcId);
   if (found) {
-    const resumed = await host.agent.resume(workspaceId, found.sessionId);
+    const resumed = host.agent.resume(workspaceId, found.sessionId);
     sessionId = resumed ? resumed.sessionId : null;
   }
   if (sessionId == null) {
     const persona = readPersona(npcId, s.gameFolder);
     const task = buildSpawnTask(npcId, persona, { scene: s.scene, commands: VERBS });
-    const spawned = await host.agent.spawn(workspaceId, {
+    const spawned = host.agent.spawn(workspaceId, {
       backend: { model: s.defaultModel },
       task,
       key: npcId,
@@ -131,13 +134,13 @@ async function ensureNpc(npcId, s) {
     });
     sessionId = spawned.sessionId;
   }
-  await reapIfNeeded(s.maxSessions);
+  reapIfNeeded(s.maxSessions);
   const entry = { npcId, sessionId, lastActiveMs: nowMs(), turns: 0 };
   pool.push(entry);
   bySession.set(sessionId, npcId);
   return entry;
 }
-async function reapIfNeeded(cap) {
+function reapIfNeeded(cap) {
   while (pool.length >= cap && pool.length > 0) {
     let oldestIdx = 0;
     for (let i = 1; i < pool.length; i++) {
@@ -146,7 +149,7 @@ async function reapIfNeeded(cap) {
     const [victim] = pool.splice(oldestIdx, 1);
     bySession.delete(victim.sessionId);
     try {
-      await host.agent.reap(victim.sessionId);
+      host.agent.reap(victim.sessionId);
     } catch {
     }
   }
@@ -156,22 +159,18 @@ function resolveTargets(text, cast) {
   if (at && cast.includes(at[1])) return { targets: [at[1]], line: at[2] };
   return { targets: cast.slice(), line: text };
 }
-async function runNpcTurn(entry, line, s) {
+function kickNpcTurn(entry, line, s) {
   entry.turns += 1;
   entry.lastActiveMs = nowMs();
   const sent = applyReminder(line, entry.turns, s.reminderEvery, entry.npcId);
-  const { ticket } = await host.agent.send(entry.sessionId, sent);
-  for (let i = 0; i < 600; i++) {
-    const r = await host.agent.poll(ticket);
-    if (r.done) return r.reply ?? "";
-  }
-  return "";
+  const { ticket } = host.agent.send(entry.sessionId, sent);
+  return ticket;
 }
 function pushMsg(pane, type, content) {
   pane.msgSeq += 1;
   pane.outbox.push({ id: `${pane.paneId}-${pane.msgSeq}`, type, content });
 }
-async function pump(paneId) {
+function pump(paneId) {
   const pane = panes.get(paneId);
   if (!pane) return;
   const s = loadSettings();
@@ -180,17 +179,29 @@ async function pump(paneId) {
     pushMsg(pane, "user", text);
     const { targets, line } = resolveTargets(text, s.cast);
     for (const npcId of targets) {
-      const entry = await ensureNpc(npcId, s);
-      const reply = await runNpcTurn(entry, line, s);
-      pushMsg(pane, "assistant", `${npcId}: ${reply}`);
+      const entry = ensureNpc(npcId, s);
+      const ticket = kickNpcTurn(entry, line, s);
+      pane.pending.push({ npcId, ticket });
     }
   }
+  const stillPending = [];
+  for (const p of pane.pending) {
+    const r = host.agent.poll(p.ticket);
+    if (r.done) {
+      pushMsg(pane, "assistant", `${p.npcId}: ${r.reply ?? ""}`);
+    } else if (r.error) {
+      pushMsg(pane, "assistant", `${p.npcId}: [error: ${r.error}]`);
+    } else {
+      stillPending.push(p);
+    }
+  }
+  pane.pending = stillPending;
 }
 var plugin = {
   // chatBackend: one session == one chat pane.
   openSession(ctx) {
     const sessionId = `npc-pane-${ctx.paneId}`;
-    panes.set(sessionId, { paneId: sessionId, inbox: [], outbox: [], msgSeq: 0 });
+    panes.set(sessionId, { paneId: sessionId, inbox: [], outbox: [], msgSeq: 0, pending: [] });
     return { sessionId };
   },
   // Sync per contract: enqueue the player's line; the host's pump processes it.
@@ -205,21 +216,23 @@ var plugin = {
     if (!pane) return { messages: [], cursor: cursor ?? "0", done: true };
     const from = cursor ? parseInt(cursor, 10) || 0 : 0;
     const messages = pane.outbox.slice(from);
-    return { messages, cursor: String(pane.outbox.length), done: pane.inbox.length === 0 };
+    const done = pane.inbox.length === 0 && pane.pending.length === 0;
+    return { messages, cursor: String(pane.outbox.length), done };
   },
   closeSession(sessionId) {
     panes.delete(sessionId);
   },
   listModels() {
     return [
-      { id: "claude-haiku-4-5-20251001", displayName: "Claude Haiku 4.5 (fast NPCs)" },
-      { id: "claude-opus-4-8", displayName: "Claude Opus 4.8 (lead roles)" }
+      { id: "haiku", displayName: "Claude Haiku (fast NPCs)" },
+      { id: "sonnet", displayName: "Claude Sonnet (balanced)" },
+      { id: "opus", displayName: "Claude Opus (lead roles)" }
     ];
   },
-  // The async work the host drives (poll-pump). Exposed so the mock host_stub
-  // can advance a turn without the real daemon loop.
+  // The host calls this each poll-loop tick to advance async NPC work (Item 6).
+  // Synchronous + non-blocking; the mock host_stub calls it once per turn too.
   pump(paneId) {
-    return pump(paneId);
+    pump(paneId);
   },
   // The inverse seam: a spawned NPC agent ran `codeterm plugin codeterm-npc <verb>`.
   onAgentCommand(ctx) {

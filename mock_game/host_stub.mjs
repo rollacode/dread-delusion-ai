@@ -110,37 +110,41 @@ function makeHost(settings) {
     fs: {},
     shell: {},
     path: {},
+    // Item 6: host.worker / host.agent are SYNC per step (job-id/poll). The stub
+    // mirrors that — methods return values directly, not Promises — so the
+    // plugin's synchronous pump consumes them the same way it will on the real
+    // daemon. The stub's agent replies resolve immediately (one pump per turn).
     worker: {
-      async start() {
+      start() {
         return { jobId: "noop" };
       },
-      async poll() {
+      poll() {
         return { done: true };
       },
     },
     workspace: {
-      async ensure() {
+      ensure() {
         return { workspaceId: `ws-${++wsSeq}` };
       },
-      async panes() {
+      panes() {
         return [];
       },
     },
     agent: {
-      async spawn(_ws, opts) {
+      spawn(_ws, opts) {
         const sessionId = `sess-${++sessionSeq}`;
         sessionMeta.set(sessionId, { npcId: opts.key ?? sessionId, turn: 0 });
         if (opts.key) keyToSession.set(opts.key, sessionId);
         return { sessionId };
       },
-      async resume(_ws, sessionId) {
+      resume(_ws, sessionId) {
         return sessionMeta.has(sessionId) ? { sessionId } : null;
       },
-      async get(_ws, key) {
+      get(_ws, key) {
         const sid = keyToSession.get(key);
         return sid ? { sessionId: sid } : null;
       },
-      async send(sessionId, text) {
+      send(sessionId, text) {
         const meta = sessionMeta.get(sessionId) ?? { npcId: sessionId, turn: 0 };
         meta.turn += 1;
         sessionMeta.set(sessionId, meta);
@@ -151,16 +155,16 @@ function makeHost(settings) {
         tickets.set(ticket, { reply: script.lines[idx], npcId: meta.npcId, sessionId, idx });
         return { ticket };
       },
-      async poll(ticket) {
+      poll(ticket) {
         const t = tickets.get(ticket);
         if (!t) return { done: true, reply: "" };
         tickets.delete(ticket);
         return { done: true, reply: t.reply };
       },
-      async reap() {},
+      reap() {},
     },
     mem: {
-      async search() {
+      search() {
         return { hits: [] };
       },
     },
