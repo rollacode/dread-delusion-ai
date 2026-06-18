@@ -47,8 +47,19 @@ function loadSettings() {
     gameFolder: typeof raw.gameFolder === "string" ? raw.gameFolder : DEFAULTS.gameFolder,
     maxSessions: typeof raw.maxSessions === "number" ? raw.maxSessions : DEFAULTS.maxSessions,
     defaultModel: typeof raw.defaultModel === "string" ? raw.defaultModel : DEFAULTS.defaultModel,
-    cast: Array.isArray(raw.cast) && raw.cast.length ? raw.cast : DEFAULTS.cast
+    cast: parseCast(raw.cast)
   };
+}
+function parseCast(raw) {
+  if (Array.isArray(raw)) {
+    const ids = raw.filter((x) => typeof x === "string" && x.trim().length > 0);
+    return ids.length ? ids : DEFAULTS.cast;
+  }
+  if (typeof raw === "string") {
+    const ids = raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+    return ids.length ? ids : DEFAULTS.cast;
+  }
+  return DEFAULTS.cast;
 }
 var VERBS = ["say", "look", "move", "emote"];
 function buildSpawnTask(npcId, persona, opts = {}) {
@@ -63,10 +74,30 @@ function buildSpawnTask(npcId, persona, opts = {}) {
   }
   lines.push(
     "",
-    "You can act in the world by running these commands (they reach the game):",
-    ...verbs.map((v) => `  codeterm plugin codeterm-npc ${v} <args>`),
+    "You act on the world ONLY by running these commands (they reach the game):",
+    ...verbs.map(
+      (v) => v === "say" ? `  codeterm plugin codeterm-npc say "<your spoken line>"` : v === "move" ? `  codeterm plugin codeterm-npc move "<location>"` : v === "emote" ? `  codeterm plugin codeterm-npc emote "<gesture>"` : `  codeterm plugin codeterm-npc look`
+    ),
     "",
-    "Speak only as your character. Keep replies to 1\u20133 short sentences."
+    "To SPEAK you MUST run the `say` command \u2014 text you merely type is NOT heard",
+    "by the player and the turn is lost. Deliver your reply as a single `say`",
+    "call (1\u20133 short sentences, in your own voice). Optionally precede or follow",
+    "it with a `move`/`emote` action. Then end your turn."
+  );
+  return lines.join("\n");
+}
+function buildPrimeTask(npcId, persona, scene) {
+  const lines = [
+    persona.trim(),
+    "",
+    `You are the character "${npcId}". Stay in character.`
+  ];
+  if (scene && scene.trim()) lines.push("", `Scene: ${scene.trim()}`);
+  lines.push(
+    "",
+    "Do not speak or act yet \u2014 the player has not addressed you. Reply with one",
+    "short word to acknowledge you are ready, then end your turn. Your acting",
+    "instructions and the player's line arrive in the next message."
   );
   return lines.join("\n");
 }
@@ -86,6 +117,7 @@ ${text}`;
 var workspaceId = null;
 var pool = [];
 var bySession = /* @__PURE__ */ new Map();
+var turnPane = /* @__PURE__ */ new Map();
 var panes = /* @__PURE__ */ new Map();
 var world = { locations: {}, log: [] };
 function nowMs() {
@@ -117,6 +149,8 @@ function ensureNpc(npcId, s) {
     const ws = host.workspace.ensure({ name: "dread-npcs", externalRoot: s.gameFolder });
     workspaceId = ws.workspaceId;
   }
+  const persona = readPersona(npcId, s.gameFolder);
+  const spawnTask = buildSpawnTask(npcId, persona, { scene: s.scene, commands: VERBS });
   let sessionId = null;
   const found = host.agent.get(workspaceId, npcId);
   if (found) {
@@ -124,18 +158,16 @@ function ensureNpc(npcId, s) {
     sessionId = resumed ? resumed.sessionId : null;
   }
   if (sessionId == null) {
-    const persona = readPersona(npcId, s.gameFolder);
-    const task = buildSpawnTask(npcId, persona, { scene: s.scene, commands: VERBS });
     const spawned = host.agent.spawn(workspaceId, {
       backend: { model: s.defaultModel },
-      task,
+      task: buildPrimeTask(npcId, persona, s.scene),
       key: npcId,
       commands: VERBS.slice()
     });
     sessionId = spawned.sessionId;
   }
   reapIfNeeded(s.maxSessions);
-  const entry = { npcId, sessionId, lastActiveMs: nowMs(), turns: 0 };
+  const entry = { npcId, sessionId, lastActiveMs: nowMs(), turns: 0, spawnTask };
   pool.push(entry);
   bySession.set(sessionId, npcId);
   return entry;
@@ -162,13 +194,24 @@ function resolveTargets(text, cast) {
 function kickNpcTurn(entry, line, s) {
   entry.turns += 1;
   entry.lastActiveMs = nowMs();
-  const sent = applyReminder(line, entry.turns, s.reminderEvery, entry.npcId);
+  let sent = applyReminder(line, entry.turns, s.reminderEvery, entry.npcId);
+  if (entry.turns === 1) {
+    sent = `${entry.spawnTask}
+
+---
+The player says to you:
+${sent}`;
+  }
   const { ticket } = host.agent.send(entry.sessionId, sent);
   return ticket;
 }
 function pushMsg(pane, type, content) {
   pane.msgSeq += 1;
   pane.outbox.push({ id: `${pane.paneId}-${pane.msgSeq}`, type, content });
+}
+function paneForTicket(ticket) {
+  const paneId = turnPane.get(ticket);
+  return paneId ? panes.get(paneId) : void 0;
 }
 function pump(paneId) {
   const pane = panes.get(paneId);
@@ -181,21 +224,37 @@ function pump(paneId) {
     for (const npcId of targets) {
       const entry = ensureNpc(npcId, s);
       const ticket = kickNpcTurn(entry, line, s);
-      pane.pending.push({ npcId, ticket });
+      bySession.set(ticket, npcId);
+      turnPane.set(ticket, pane.paneId);
+      pane.pending.push({ npcId, ticket, said: false });
     }
   }
   const stillPending = [];
   for (const p of pane.pending) {
     const r = host.agent.poll(p.ticket);
     if (r.done) {
-      pushMsg(pane, "assistant", `${p.npcId}: ${r.reply ?? ""}`);
+      if (!p.said) {
+        const reply = (r.reply ?? "").trim();
+        if (reply && !isPlaceholderReply(reply)) {
+          pushMsg(pane, "assistant", `${p.npcId}: ${reply}`);
+        }
+      }
+      clearTurn(p.ticket);
     } else if (r.error) {
-      pushMsg(pane, "assistant", `${p.npcId}: [error: ${r.error}]`);
+      if (!p.said) pushMsg(pane, "assistant", `${p.npcId}: [error: ${r.error}]`);
+      clearTurn(p.ticket);
     } else {
       stillPending.push(p);
     }
   }
   pane.pending = stillPending;
+}
+function clearTurn(ticket) {
+  bySession.delete(ticket);
+  turnPane.delete(ticket);
+}
+function isPlaceholderReply(reply) {
+  return /^\((?:claude|codex|agent|opencode)[^)]*\)$/i.test(reply.trim());
 }
 var plugin = {
   // chatBackend: one session == one chat pane.
@@ -235,23 +294,33 @@ var plugin = {
     pump(paneId);
   },
   // The inverse seam: a spawned NPC agent ran `codeterm plugin codeterm-npc <verb>`.
+  // This is how an NPC ACTS. `say` is also how it SPEAKS: the line is pushed to
+  // the owning pane's outbox so it surfaces as the chat reply (live, mid-turn).
   onAgentCommand(ctx) {
     const npcId = bySession.get(ctx.sessionId);
     if (!npcId) return { error: `unknown session ${ctx.sessionId}` };
     const verb = ctx.verb;
     const arg = ctx.args.join(" ");
+    const pane = paneForTicket(ctx.sessionId);
     switch (verb) {
       case "say": {
+        if (pane && arg) {
+          pushMsg(pane, "assistant", `${npcId}: ${arg}`);
+          const turn = pane.pending.find((p) => p.ticket === ctx.sessionId);
+          if (turn) turn.said = true;
+        }
         world.log.push(`say ${npcId}: ${arg}`);
         return { result: `say|${npcId}|${arg}` };
       }
       case "move": {
         world.locations[npcId] = arg;
         world.log.push(`move ${npcId} \u2192 ${arg}`);
+        if (pane) pushMsg(pane, "assistant", `*${npcId} moves to ${arg}*`);
         return { result: `${npcId} moved to ${arg}` };
       }
       case "emote": {
         world.log.push(`emote ${npcId}: ${arg}`);
+        if (pane) pushMsg(pane, "assistant", `*${npcId} ${arg}*`);
         return { result: `emote|${npcId}|${arg}` };
       }
       case "look": {
@@ -269,6 +338,7 @@ var plugin = {
   __test_buildSpawnTask: buildSpawnTask,
   __test_shouldRemind: shouldRemind,
   __test_applyReminder: applyReminder,
+  __test_parseCast: parseCast,
   __test_world: () => world,
   __test_registerSession: (sessionId, npcId) => {
     bySession.set(sessionId, npcId);
@@ -277,6 +347,7 @@ var plugin = {
     workspaceId = null;
     pool = [];
     bySession.clear();
+    turnPane.clear();
     panes.clear();
     world = { locations: {}, log: [] };
   }

@@ -67,8 +67,26 @@ function loadSettings(): NpcSettings {
     maxSessions: typeof raw.maxSessions === "number" ? raw.maxSessions : DEFAULTS.maxSessions,
     defaultModel:
       typeof raw.defaultModel === "string" ? raw.defaultModel : DEFAULTS.defaultModel,
-    cast: Array.isArray(raw.cast) && raw.cast.length ? raw.cast : DEFAULTS.cast,
+    cast: parseCast(raw.cast),
   };
+}
+
+// `cast` may arrive as a YAML/JSON array OR — as the config.yaml surface writes
+// it — a single comma-separated string ("npc_morozov, npc_xenia"). Accept both
+// so a configured cast is honored instead of silently falling back to defaults.
+function parseCast(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    const ids = raw.filter((x): x is string => typeof x === "string" && x.trim().length > 0);
+    return ids.length ? ids : DEFAULTS.cast;
+  }
+  if (typeof raw === "string") {
+    const ids = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    return ids.length ? ids : DEFAULTS.cast;
+  }
+  return DEFAULTS.cast;
 }
 
 // ── pure helpers (the unit-test oracle) ──
@@ -80,6 +98,13 @@ type Verb = (typeof VERBS)[number];
 // host-side prompt injection (spec: CodeTerm bakes nothing into prompts). The
 // persona comes from npc_scripts/<id>.md; the verbs are taught as CLI calls the
 // agent can make, which route back to this plugin via onAgentCommand.
+//
+// CRITICAL (the designed environment pattern): the agent ACTS through plugin
+// verbs. An NPC is a one-shot agent turn — its raw transcript text is NOT heard
+// by the player. To speak, it MUST run `codeterm plugin codeterm-npc say
+// "<line>"`; the say verb routes through onAgentCommand → the pane outbox → the
+// chat transcript. Prose typed without `say` is dropped, which is exactly the
+// "(agent stopped) without speaking" gap this prompt closes.
 function buildSpawnTask(
   npcId: string,
   persona: string,
@@ -96,10 +121,43 @@ function buildSpawnTask(
   }
   lines.push(
     "",
-    "You can act in the world by running these commands (they reach the game):",
-    ...verbs.map((v) => `  codeterm plugin codeterm-npc ${v} <args>`),
+    "You act on the world ONLY by running these commands (they reach the game):",
+    ...verbs.map((v) =>
+      v === "say"
+        ? `  codeterm plugin codeterm-npc say "<your spoken line>"`
+        : v === "move"
+          ? `  codeterm plugin codeterm-npc move "<location>"`
+          : v === "emote"
+            ? `  codeterm plugin codeterm-npc emote "<gesture>"`
+            : `  codeterm plugin codeterm-npc look`,
+    ),
     "",
-    "Speak only as your character. Keep replies to 1–3 short sentences.",
+    "To SPEAK you MUST run the `say` command — text you merely type is NOT heard",
+    "by the player and the turn is lost. Deliver your reply as a single `say`",
+    "call (1–3 short sentences, in your own voice). Optionally precede or follow",
+    "it with a `move`/`emote` action. Then end your turn.",
+  );
+  return lines.join("\n");
+}
+
+// The spawn turn only PRIMES the session: it establishes the persona but must
+// not speak or act, because it has no player line yet and its callbacks route
+// under the spawn session id (not a live pane) — they'd be dropped anyway. The
+// real reply is the first `send` turn, which carries the full task + the line.
+// Keeping the prime silent avoids a one-shot agent "acting into the void" and
+// racing the send turn on first contact.
+function buildPrimeTask(npcId: string, persona: string, scene?: string): string {
+  const lines = [
+    persona.trim(),
+    "",
+    `You are the character "${npcId}". Stay in character.`,
+  ];
+  if (scene && scene.trim()) lines.push("", `Scene: ${scene.trim()}`);
+  lines.push(
+    "",
+    "Do not speak or act yet — the player has not addressed you. Reply with one",
+    "short word to acknowledge you are ready, then end your turn. Your acting",
+    "instructions and the player's line arrive in the next message.",
   );
   return lines.join("\n");
 }
@@ -137,6 +195,11 @@ interface PoolEntry {
   sessionId: string;
   lastActiveMs: number;
   turns: number;
+  // The persona + verb instructions. A fresh `host.agent.send` turn cannot rely
+  // on the spawn turn's context being resumed on first contact (the provider
+  // session isn't captured yet), so the first turn carries this verbatim — that
+  // is what keeps the responding agent in character and aware it must `say`.
+  spawnTask: string;
 }
 
 // ── mock world state (mutated by onAgentCommand: move/look/emote) ──
@@ -158,16 +221,21 @@ interface PaneSession {
 
 // An NPC turn kicked off via host.agent.send, awaiting its reply. pump harvests
 // these non-blockingly: one host.agent.poll per tick, push the reply when done.
+// `said` flips true once the agent delivered its line through the `say` verb
+// (onAgentCommand → outbox); the harvest then skips the raw reply so we don't
+// double-post (or surface a "(agent stopped)" placeholder over the spoken line).
 interface PendingTurn {
   npcId: string;
   ticket: string;
+  said: boolean;
 }
 
 // Module-level state: the QuickJS VM is a per-plugin singleton, so this is the
 // plugin's whole runtime memory.
 let workspaceId: string | null = null;
 let pool: PoolEntry[] = [];
-const bySession = new Map<string, string>(); // agent sessionId → npc_id
+const bySession = new Map<string, string>(); // agent sessionId / turn ticket → npc_id
+const turnPane = new Map<string, string>(); // turn ticket → owning chat paneId
 const panes = new Map<string, PaneSession>();
 let world: World = { locations: {}, log: [] };
 
@@ -207,6 +275,11 @@ function ensureNpc(npcId: string, s: NpcSettings): PoolEntry {
     workspaceId = ws.workspaceId;
   }
 
+  // The persona + verb instructions, built once and kept on the entry so the
+  // first turn can carry it verbatim (resume can't guarantee context yet).
+  const persona = readPersona(npcId, s.gameFolder);
+  const spawnTask = buildSpawnTask(npcId, persona, { scene: s.scene, commands: VERBS });
+
   // Re-attach a stored session for this key if the host remembers one (R3),
   // else spawn a fresh one with the persona as its task.
   let sessionId: string | null = null;
@@ -216,11 +289,10 @@ function ensureNpc(npcId: string, s: NpcSettings): PoolEntry {
     sessionId = resumed ? resumed.sessionId : null;
   }
   if (sessionId == null) {
-    const persona = readPersona(npcId, s.gameFolder);
-    const task = buildSpawnTask(npcId, persona, { scene: s.scene, commands: VERBS });
+    // Spawn with a silent prime; the full persona+verb task rides the first send.
     const spawned = host.agent.spawn(workspaceId, {
       backend: { model: s.defaultModel },
-      task,
+      task: buildPrimeTask(npcId, persona, s.scene),
       key: npcId,
       commands: VERBS.slice(),
     });
@@ -229,7 +301,7 @@ function ensureNpc(npcId: string, s: NpcSettings): PoolEntry {
 
   reapIfNeeded(s.maxSessions);
 
-  const entry: PoolEntry = { npcId, sessionId, lastActiveMs: nowMs(), turns: 0 };
+  const entry: PoolEntry = { npcId, sessionId, lastActiveMs: nowMs(), turns: 0, spawnTask };
   pool.push(entry);
   bySession.set(sessionId, npcId);
   return entry;
@@ -265,7 +337,13 @@ function resolveTargets(text: string, cast: string[]): { targets: string[]; line
 function kickNpcTurn(entry: PoolEntry, line: string, s: NpcSettings): string {
   entry.turns += 1;
   entry.lastActiveMs = nowMs();
-  const sent = applyReminder(line, entry.turns, s.reminderEvery, entry.npcId);
+  let sent = applyReminder(line, entry.turns, s.reminderEvery, entry.npcId);
+  // First contact: carry the persona + verb instructions, since the resumed
+  // provider session isn't established yet and the bare line alone would reach
+  // a context-free agent (out of character, unaware it must `say`).
+  if (entry.turns === 1) {
+    sent = `${entry.spawnTask}\n\n---\nThe player says to you:\n${sent}`;
+  }
   const { ticket } = host.agent.send(entry.sessionId, sent);
   return ticket;
 }
@@ -273,6 +351,14 @@ function kickNpcTurn(entry: PoolEntry, line: string, s: NpcSettings): string {
 function pushMsg(pane: PaneSession, type: string, content: string): void {
   pane.msgSeq += 1;
   pane.outbox.push({ id: `${pane.paneId}-${pane.msgSeq}`, type, content });
+}
+
+// Resolve the pane that owns an in-flight turn ticket, so a verb callback knows
+// which transcript to speak into. Null for a ticket with no live pane (e.g. the
+// pure-unit onAgentCommand test, which never opened a pane).
+function paneForTicket(ticket: string): PaneSession | undefined {
+  const paneId = turnPane.get(ticket);
+  return paneId ? panes.get(paneId) : undefined;
 }
 
 // The turn-advance the host drives, called on EACH poll-loop tick (Item 6).
@@ -288,7 +374,11 @@ function pump(paneId: string): void {
   if (!pane) return;
   const s = loadSettings();
 
-  // Phase 1 — kick sends for new player lines.
+  // Phase 1 — kick sends for new player lines. The turn runs under a fresh
+  // ticket worker id, so map that ticket → npc_id and → this pane: the agent's
+  // own `codeterm plugin codeterm-npc say` callback arrives under the ticket as
+  // ctx.sessionId, and onAgentCommand uses these maps to resolve the NPC and
+  // the outbox to speak into.
   while (pane.inbox.length) {
     const text = pane.inbox.shift() as string;
     pushMsg(pane, "user", text);
@@ -296,7 +386,9 @@ function pump(paneId: string): void {
     for (const npcId of targets) {
       const entry = ensureNpc(npcId, s);
       const ticket = kickNpcTurn(entry, line, s);
-      pane.pending.push({ npcId, ticket });
+      bySession.set(ticket, npcId);
+      turnPane.set(ticket, pane.paneId);
+      pane.pending.push({ npcId, ticket, said: false });
     }
   }
 
@@ -305,14 +397,37 @@ function pump(paneId: string): void {
   for (const p of pane.pending) {
     const r = host.agent.poll(p.ticket);
     if (r.done) {
-      pushMsg(pane, "assistant", `${p.npcId}: ${r.reply ?? ""}`);
+      // The spoken line normally arrives live via the `say` verb (p.said). If
+      // the agent never spoke, fall back to its captured final line — but drop
+      // bare "(agent stopped)"-style placeholders rather than voice them.
+      if (!p.said) {
+        const reply = (r.reply ?? "").trim();
+        if (reply && !isPlaceholderReply(reply)) {
+          pushMsg(pane, "assistant", `${p.npcId}: ${reply}`);
+        }
+      }
+      clearTurn(p.ticket);
     } else if (r.error) {
-      pushMsg(pane, "assistant", `${p.npcId}: [error: ${r.error}]`);
+      if (!p.said) pushMsg(pane, "assistant", `${p.npcId}: [error: ${r.error}]`);
+      clearTurn(p.ticket);
     } else {
       stillPending.push(p); // not done yet — check again next tick
     }
   }
   pane.pending = stillPending;
+}
+
+// Drop the per-turn ticket maps once the turn is terminal. Only the ticket
+// entries are removed — the NPC's long-lived spawn session mapping stays.
+function clearTurn(ticket: string): void {
+  bySession.delete(ticket);
+  turnPane.delete(ticket);
+}
+
+// A one-shot agent that exits without speaking yields a host placeholder, not a
+// line — never voice those as the NPC's reply.
+function isPlaceholderReply(reply: string): boolean {
+  return /^\((?:claude|codex|agent|opencode)[^)]*\)$/i.test(reply.trim());
 }
 
 // ── the plugin module ──
@@ -371,25 +486,36 @@ const plugin: NpcPlugin = {
   },
 
   // The inverse seam: a spawned NPC agent ran `codeterm plugin codeterm-npc <verb>`.
+  // This is how an NPC ACTS. `say` is also how it SPEAKS: the line is pushed to
+  // the owning pane's outbox so it surfaces as the chat reply (live, mid-turn).
   onAgentCommand(ctx: AgentCommandCtx): { result: string } | { error: string } {
     const npcId = bySession.get(ctx.sessionId);
     if (!npcId) return { error: `unknown session ${ctx.sessionId}` };
     const verb = ctx.verb as Verb;
     const arg = ctx.args.join(" ");
+    const pane = paneForTicket(ctx.sessionId);
     switch (verb) {
       case "say": {
-        // Forward the NPC's spoken line to the (mock) game, pipe-delimited so the
-        // harness can route it: speaker | text.
+        // The NPC's spoken line. Surface it in the chat transcript (the headline
+        // path: say → onAgentCommand → outbox → chat), and mark the turn spoken
+        // so the harvest won't double-post. Also log to the (mock) game world.
+        if (pane && arg) {
+          pushMsg(pane, "assistant", `${npcId}: ${arg}`);
+          const turn = pane.pending.find((p) => p.ticket === ctx.sessionId);
+          if (turn) turn.said = true;
+        }
         world.log.push(`say ${npcId}: ${arg}`);
         return { result: `say|${npcId}|${arg}` };
       }
       case "move": {
         world.locations[npcId] = arg;
         world.log.push(`move ${npcId} → ${arg}`);
+        if (pane) pushMsg(pane, "assistant", `*${npcId} moves to ${arg}*`);
         return { result: `${npcId} moved to ${arg}` };
       }
       case "emote": {
         world.log.push(`emote ${npcId}: ${arg}`);
+        if (pane) pushMsg(pane, "assistant", `*${npcId} ${arg}*`);
         return { result: `emote|${npcId}|${arg}` };
       }
       case "look": {
@@ -410,6 +536,7 @@ const plugin: NpcPlugin = {
   __test_buildSpawnTask: buildSpawnTask,
   __test_shouldRemind: shouldRemind,
   __test_applyReminder: applyReminder,
+  __test_parseCast: parseCast,
   __test_world: (): World => world,
   __test_registerSession: (sessionId: string, npcId: string): void => {
     bySession.set(sessionId, npcId);
@@ -418,6 +545,7 @@ const plugin: NpcPlugin = {
     workspaceId = null;
     pool = [];
     bySession.clear();
+    turnPane.clear();
     panes.clear();
     world = { locations: {}, log: [] };
   },

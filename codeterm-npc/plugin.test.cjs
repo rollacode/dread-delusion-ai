@@ -62,6 +62,18 @@ test("applyReminder prepends a stay-in-character note only when due", () => {
   assert(notDue === text, "off-cadence turns pass through unchanged");
 });
 
+// ── cast parsing: config.yaml writes a comma-separated string, not an array ──
+
+test("parseCast accepts a comma-separated string and an array", () => {
+  const fromString = plugin.__test_parseCast("npc_morozov, npc_xenia");
+  assert(Array.isArray(fromString) && fromString.length === 2, "string → 2 ids");
+  assert(fromString[0] === "npc_morozov" && fromString[1] === "npc_xenia", "ids trimmed in order");
+  const fromArray = plugin.__test_parseCast(["npc_a", "npc_b"]);
+  assert(fromArray.length === 2 && fromArray[1] === "npc_b", "array passes through");
+  const fallback = plugin.__test_parseCast(undefined);
+  assert(fallback.length >= 1, "missing cast falls back to defaults, not empty");
+});
+
 // ── onAgentCommand: the inverse seam (agent → game) ──
 
 test("onAgentCommand('say') formats a game-bound line for the mapped NPC", () => {
