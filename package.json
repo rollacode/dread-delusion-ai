@@ -1,0 +1,24 @@
+{
+  "name": "dread-delusion-ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Dread Delusion NPC environment for CodeTerm: a chatBackend plugin that drives a team of in-character NPC agent sessions, plus a mock-game harness proving the agent-driven-environment pattern with the game mocked.",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rollacode/dread-delusion-ai.git"
+  },
+  "scripts": {
+    "build": "node scripts/build-plugin.mjs codeterm-npc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && npx tsx codeterm-npc/plugin.test.cjs",
+    "demo": "npm run build && node mock_game/host_stub.mjs demo"
+  },
+  "devDependencies": {
+    "@codeterm/plugin-sdk": "^1.4.9",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3"
+  }
+}

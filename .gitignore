@@ -7,3 +7,4 @@ build/
 dist/
 plugin/bin/
 plugin/obj/
+node_modules/

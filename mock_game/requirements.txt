@@ -1,0 +1,8 @@
+# The harness + its test run with the Python standard library only (a built-in
+# frontmatter splitter falls back when python-frontmatter is absent).
+# Install these only to use the optional REST mode (`server.py --rest`) or the
+# nicer frontmatter parser.
+python-frontmatter>=1.1
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.0

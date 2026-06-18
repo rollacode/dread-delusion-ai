@@ -1,0 +1,74 @@
+[
+  {
+    "kind": "section",
+    "title": "Scene",
+    "description": "What the NPCs know about the world they're in.",
+    "fields": [
+      {
+        "kind": "text",
+        "key": "scene",
+        "label": "Scene description",
+        "placeholder": "Феррополис. Зима затянулась. Граница закрыта.",
+        "description": "Prepended to each NPC's spawn task so the whole cast shares a setting."
+      },
+      {
+        "kind": "text",
+        "key": "gameFolder",
+        "label": "Game folder",
+        "placeholder": ".",
+        "description": "Workspace root for the NPC team, and where npc_scripts/<id>.md personas live."
+      },
+      {
+        "kind": "text",
+        "key": "cast",
+        "label": "Cast (comma-separated npc_ids)",
+        "placeholder": "npc_morozov, npc_xenia, npc_culwich",
+        "description": "NPCs present in the scene. A player line with no @target is heard by all of them."
+      }
+    ]
+  },
+  {
+    "kind": "section",
+    "title": "Acting",
+    "description": "How the agent sessions are managed.",
+    "fields": [
+      {
+        "kind": "number",
+        "key": "reminderEvery",
+        "label": "Stay-in-character reminder every N turns",
+        "default": 4,
+        "min": 0,
+        "description": "Per-NPC cadence. 0 disables the reminder."
+      },
+      {
+        "kind": "number",
+        "key": "maxSessions",
+        "label": "Max live NPC sessions (LRU)",
+        "default": 5,
+        "min": 1,
+        "description": "The plugin reaps the oldest idle session when over this cap."
+      },
+      {
+        "kind": "text",
+        "key": "defaultModel",
+        "label": "Default NPC model",
+        "placeholder": "haiku",
+        "description": "Model tier the NPC agent sessions spawn with."
+      }
+    ]
+  },
+  {
+    "kind": "section",
+    "title": "Voice (optional)",
+    "description": "ElevenLabs text-to-speech for NPC lines.",
+    "fields": [
+      {
+        "kind": "password",
+        "key": "elevenLabsKey",
+        "label": "ElevenLabs API key",
+        "secret": true,
+        "description": "SECRET — routed to the plugin's secret bucket, never written plaintext into config. Resolved at runtime via host.secretGet."
+      }
+    ]
+  }
+]

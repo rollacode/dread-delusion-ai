@@ -1,0 +1,24 @@
+{
+  "id": "codeterm-npc",
+  "version": "0.1.0",
+  "minCodeterm": "1.0.0",
+  "hostApi": 2,
+  "displayName": "Dread NPCs",
+  "description": "Turns a CodeTerm chat pane into a multi-NPC acting stage. Owns a workspace and a small LRU pool of in-character agent sessions (one per NPC), routes the player's line to the addressed NPC(s), injects a stay-in-character reminder on a per-NPC turn cadence, and exposes say/look/move/emote verbs the NPC agents call back to act on the game world.",
+  "readme": "README.md",
+  "agentDoc": "AGENT.md",
+  "iconHint": "🎭",
+  "iconColor": "#7c4dff",
+  "entry": "plugin.js",
+  "capabilities": {
+    "chatBackend": true
+  },
+  "permissions": {
+    "manage_workspaces": true,
+    "spawn_agents": true,
+    "agent_commands": true,
+    "secrets": true
+  },
+  "settingsSchema": "settings.schema.json",
+  "iconSvg": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 11a7 7 0 0 1 14 0c0 4-3 6-3 8H6c0-2-3-4-3-8z\"/><path d=\"M8 11h.01\"/><path d=\"M14 11h.01\"/><path d=\"M21 9c0 3-2 4-2 6\"/></svg>"
+}
